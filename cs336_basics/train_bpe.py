@@ -3,12 +3,13 @@
 import regex as re  # `regex` supports \p{L}, \p{N} Unicode property escapes; stdlib `re` does not
 import json
 import multiprocessing
+from tqdm import tqdm
 from cs336_basics.pretokenization_example import find_chunk_boundaries
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
-def _pretokenize_chunk(args: tuple) -> list[list[bytes]]:
-    """Worker function: pre-tokenize a single chunk of the file."""
+def _pretokenize_chunk(args: tuple) -> dict[tuple, int]:
+    """Worker function: pre-tokenize a single chunk and return deduplicated counts."""
     input_path, start, end, special_tokens = args
     with open(input_path, "rb") as f:
         f.seek(start)
@@ -21,13 +22,14 @@ def _pretokenize_chunk(args: tuple) -> list[list[bytes]]:
     else:
         segments = [chunk]
 
-    result = []
+    counts: dict[tuple, int] = {}
     for segment in segments:
         for match in re.finditer(PAT, segment):
             pre_token_bytes = match.group(0).encode("utf-8")
-            result.append([bytes([b]) for b in pre_token_bytes])
+            key = tuple(bytes([b]) for b in pre_token_bytes)
+            counts[key] = counts.get(key, 0) + 1
 
-    return result
+    return counts
 
 class BPETrainer:
 
@@ -55,6 +57,8 @@ class BPETrainer:
         """
 
         # --- Step 1: Find chunk boundaries ---
+        import time as _time
+        t0 = _time.time()
         num_processes = multiprocessing.cpu_count()
         with open(input_path, "rb") as f:
             boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
@@ -80,6 +84,8 @@ class BPETrainer:
             vocab[256 + i] = token.encode("utf-8")
 
         # --- Step 4: Parallel pre-tokenization ---
+        t1 = _time.time()
+        print(f"[Step 1] Chunk boundaries: {t1 - t0:.2f}s")
         chunk_args = [(input_path, start, end, special_tokens) for start, end in zip(boundaries[:-1], boundaries[1:])]
         if len(chunk_args) <= 1:
             chunk_results = [_pretokenize_chunk(args) for args in chunk_args]
@@ -87,12 +93,11 @@ class BPETrainer:
             with multiprocessing.Pool(processes=num_processes) as pool:
                 chunk_results = pool.map(_pretokenize_chunk, chunk_args)
         
-        # flatten and deduplicate: count how many times each unique pre-token appears
+        # flatten and deduplicate: merge counts from all chunks
         pre_token_counts: dict[tuple, int] = {}
-        for chunk in chunk_results:
-            for seq in chunk:
-                key = tuple(seq)
-                pre_token_counts[key] = pre_token_counts.get(key, 0) + 1
+        for chunk_counts in chunk_results:
+            for key, count in chunk_counts.items():
+                pre_token_counts[key] = pre_token_counts.get(key, 0) + count
         if debug:
             print(f"Chunk size: {boundaries[1] - boundaries[0]} bytes")
             print(f"Total unique pre-tokens: {len(pre_token_counts)}")
@@ -103,6 +108,8 @@ class BPETrainer:
         next_vocab_id = len(vocab)
 
         # --- Step 6: BPE merge loop ---
+        t2 = _time.time()
+        print(f"[Step 2] Pre-tokenization + dedup: {t2 - t1:.2f}s")
         # Build initial freq from scratch, then update incrementally
         freq: dict[tuple[bytes, bytes], int] = {}
         for seq_tuple, count in pre_token_counts.items():
@@ -119,6 +126,10 @@ class BPETrainer:
                     pair_to_seqs[pair] = set()
                 pair_to_seqs[pair].add(seq_tuple)
 
+        num_merges = vocab_size - len(vocab)
+        t3 = _time.time()
+        print(f"[Step 3] Build freq + inverted index: {t3 - t2:.2f}s")
+        pbar = tqdm(total=num_merges, desc="BPE merges")
         while len(vocab) < vocab_size:
             if not freq:
                 break
@@ -134,6 +145,7 @@ class BPETrainer:
             vocab[next_vocab_id] = merged_token
             next_vocab_id += 1
             merges.append(most_frequent_pair)
+            pbar.update(1)
 
             # --- Step 6d: Apply merge and incrementally update freq ---
             # Only process sequences that actually contain the merged pair
@@ -194,15 +206,48 @@ class BPETrainer:
                     pair_to_seqs[p].add(new_seq_tuple)
 
         # --- Step 7: Return vocab and merges ---
+        t4 = _time.time()
+        print(f"[Step 4] Merge loop: {t4 - t3:.2f}s")
+        pbar.close()
         return (vocab, merges)
 
 
 
 if __name__ == "__main__":
+    import time
+    import tracemalloc
+
+    tracemalloc.start()
+    start_time = time.time()
+
     trainer = BPETrainer()
     vocab, merges = trainer.train(
         input_path="data/TinyStoriesV2-GPT4-train.txt",
-        vocab_size=1000,
-        special_tokens=["<PAD>", "<UNK>", "<BOS>", "<EOS>"],
-        debug=True,
+        vocab_size=10000,
+        special_tokens=["<|endoftext|>"],
     )
+
+    elapsed = time.time() - start_time
+    current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    print(f"Training time: {elapsed:.1f}s ({elapsed/60:.1f} min)")
+    print(f"Peak memory: {peak / 1024**3:.2f} GB")
+
+    # Find longest token
+    longest_token = max(vocab.values(), key=len)
+    print(f"Longest token: {longest_token} (length {len(longest_token)} bytes)")
+    print(f"Longest token decoded: {longest_token.decode('utf-8', errors='replace')}")
+
+    # Serialize vocab and merges
+    vocab_serializable = {str(k): v.hex() for k, v in vocab.items()}
+    with open("data/bpe_vocab.json", "w") as f:
+        json.dump(vocab_serializable, f, indent=2)
+
+    merges_serializable = [[m[0].hex(), m[1].hex()] for m in merges]
+    with open("data/bpe_merges.json", "w") as f:
+        json.dump(merges_serializable, f, indent=2)
+
+    print(f"Vocab size: {len(vocab)}")
+    print(f"Merges count: {len(merges)}")
+    print("Saved vocab to data/bpe_vocab.json and merges to data/bpe_merges.json")
